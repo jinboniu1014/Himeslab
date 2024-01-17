@@ -1,0 +1,765 @@
+---
+title: "SVI ADI map"
+author: "Jinbo niu"
+date: "2024-01-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(haven)
+library(tidyverse)
+library(readxl)
+library(tigris)
+library(tidycensus)
+library(sf)
+library(leaflet)
+library(gridExtra)
+library(RColorBrewer)
+library(kableExtra)
+library(broom.mixed)
+library(modelsummary)
+library(gtsummary)
+library(cowplot)
+library(lme4)
+library(survey)
+library(srvyr)
+options(tigris_use_cache = TRUE)
+options(progress_enabled = FALSE)
+```
+
+### Functions
+
+```{r functions}
+#' Generate custom scatter plot
+#'
+#' @param df Dataset
+#' @param variable_x Variable on x axis
+#' @param variable_y Variable on y axis
+#'
+#' @return Custom scatter plot with linear and polynomial smooths
+#' 
+my_point_plot <- function(df,
+                          variable_x,
+                          variable_y) {
+  df |>
+    ggplot(aes(x = {{variable_x}}, y = {{variable_y}})) +
+    geom_point(alpha = 0.5, colour = "darkgrey") +
+    geom_smooth(
+      method = 'lm',
+      formula = y ~ poly(x, 2),
+      aes(color = 'polynomial'),
+      se = FALSE
+    ) +
+    geom_smooth(
+      method = 'lm',
+      formula = y ~ x,
+      aes(color = 'linear'),
+      se = FALSE
+    ) +
+    my_theme() +
+    theme(legend.position = "none")
+}
+
+#' Generate custom boxplot
+#'
+#' @param df Dataset
+#' @param variable_x Variable on x axis
+#' @param variable_y Variable on y axis
+#'
+#' @return Custom boxplot with shaded violin plot
+#' 
+my_box_plot <- function(df,
+                        variable_x,
+                        variable_y){
+  df |>
+    ggplot(aes(x = {{variable_x}}, y = {{variable_y}})) +
+    my_theme() +
+    geom_violin(fill = "#95ccbb",
+                colour = NA,
+                alpha = 0.8) +
+    geom_boxplot(alpha = 0)
+}
+
+#' Custom ggplot theme
+#'
+#'
+my_theme <- function() {
+  theme_half_open() +
+    theme(
+      panel.grid = element_line(color = "white"),
+      legend.key.size = unit(0.4, "cm"),
+      legend.text = element_text(size = 10),
+      legend.title = element_text(size = 12),
+      plot.title = element_text(size = 16)
+    )
+}
+
+#  This function was taken from https://rdrr.io/github/bradisbrad/olfatbones/src/R/get_tri.R
+#' Triangularize a Correlation Matrix
+#' @description Takes a correlation matrix and removes the redundant information
+#'
+#' @param cormat Correlation Matrix
+#' @param lower Lower or upper half (default = T) select F for upper half
+#'
+#' @return Matrix
+#' @export get_tri
+#'
+#' @examples
+#' cormat <- round(cor(mtcars), 2)
+#' get_tri(cormat)
+#'
+get_tri <- function(cormat, lower = T){
+  if(lower){
+    cormat[upper.tri(cormat)] <- NA
+  } else {
+    cormat[lower.tri(cormat)] <- NA
+  }
+  cormat
+}
+
+
+#' Adapted from https://rpubs.com/cqj_00/785193
+#' Compute correlations for pairs of variables using Spearman's correlation and plot using heatmap
+#'
+#' @param df Dataset restricted to only continuous variables
+#'
+#' @return Heatmap of Spearman's rank correlation coefficient for each combination of continous variables
+#' 
+get_corr_plot <- function(df) {
+  combined_corrs <- df |>
+    cor(use = "complete.obs", method = "spearman") |>
+    as.matrix() |>
+    get_tri() |>
+    reshape2::melt(na.rm = TRUE) |>
+    rename(variable_1 = Var1,
+           variable_2 = Var2)
+  
+  combined_corrs |>
+    ggplot(aes(x = variable_2, y = variable_1, fill = value)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(
+      low = "blue",
+      high = "red",
+      mid = "grey100",
+      limit = c(-1, 0.999), # 0.999 so correlation of 1 appear grey
+      space = "Lab",
+      name = "Spearman\nCorrelation"
+    ) +
+  geom_text(aes(label = round(value, 2))) +
+    my_theme() +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        vjust = 1,
+        size = 10,
+        hjust = 1
+      ),
+      axis.text.y = element_text(size = 10)
+    ) +
+    coord_fixed() +
+    coord_flip()
+
+}
+
+#' Compute weighted survey means for a variable
+#'
+#' @param smart_df SMART BRFSS dataset
+#' @param smart_survey Survey design object for SMART BRFSS dataset (generated using srvyr::as_survey_design() )
+#' @param variable_name Variable to compute as weighted survey means
+#'
+#' @return Table with weighted (prefixed with w_) and unweighted (prefixed with uw_) means for variable for each MMSA
+#' 
+get_mmsa_survey_means <- function(smart_df,
+                                  smart_survey,
+                                  variable_name){
+  # get unweighted means by mmsa (uw_)
+  uw_mmsa_tbl <- smart_df |>
+    select(d_mmsa, mmsaname, {{variable_name}}) |>
+    group_by(d_mmsa, mmsaname) |>
+    summarise(across(starts_with(variable_name), ~ mean(.x, na.rm = TRUE), .names = "uw_{.col}"))
+  
+  # get weighted means by mmsa using svyby (w_)
+  w_mmsa_tbl <- svyby(
+    ~ temp_var_name,
+    ~ d_mmsa,
+    design = smart_survey |> rename(temp_var_name = {{variable_name}}),
+    FUN = svymean,
+    na.rm = TRUE
+  ) |>
+    rename_with( ~ str_replace(.x, "temp_var_name", paste0("w_", variable_name)))
+  # combine
+  ever_smoker_mmsa_tbl <- uw_mmsa_tbl |>
+    inner_join(w_mmsa_tbl, by = "d_mmsa") |>
+    rename_with( ~ str_replace(.x, "w_d_", "w_")) |> 
+    select(- se)
+}
+```
+
+## SVI Dataset 
+
+```{r}
+svi2020 <- read.csv("Data/SVI_2020_US_county.csv")
+```
+
+### Map
+
+#### Nationwide map
+
+```{r plotmmsacounties}
+# download US counties shapefile 
+tigris_counties <- counties()
+mmsa_county_mapping_geoid <- mmsa_county_mapping |>
+  mutate(smart = TRUE) |> 
+  inner_join(tigris_counties, by = c("fips_state_code"= "STATEFP", "fips_county_code" = "COUNTYFP")) |>
+  mutate(smart = replace_na(smart, FALSE))
+
+# check mmsas retained
+# mmsa_county_mapping_geoid |> filter(smart == TRUE) |> nrow() == mmsa_county_mapping |> nrow()
+
+mmsa_county_mapping_geoid_sf <- mmsa_county_mapping_geoid |>
+  filter(!fips_state_code %in% c("02",
+                         "15", "60",
+                         "66", "69",
+                         "72", "78")) |> # limit to contiguous states and DC
+  st_as_sf()
+
+# Change the CRS (Coordinate Reference System) to 4326 because leaflet expects the data provided to it to be in WGS84 (EPSG:4326)
+mmsa_county_mapping_geoid_sf_4326 <- st_transform(mmsa_county_mapping_geoid_sf, crs = 4326)
+mmsa_county_mapping_geoid_sf_4326 |> saveRDS("Map/mmsa_county_mapping_geoid_sf_4326.rds")
+
+mmsa_county_mapping_geoid_sf_4326 <- readRDS("Map/mmsa_county_mapping_geoid_sf_4326.rds")
+```
+
+```{r mapsvi1}
+#| eval: false
+svi2020$FIPS <- as.character(svi2020$FIPS)
+svi2020_sf <- svi2020 |>
+  # select summary theme ranking variables
+select(starts_with("RPL_"), FIPS,ST_ABBR) |> 
+  # join with county shapefile
+  left_join(tigris_counties, by = c("FIPS" = "GEOID")) |> 
+  # convert to sf
+  st_as_sf()
+
+svi2020_sf_4326 <- st_transform(svi2020_sf, crs = 4326)
+svi2020_sf_4326 |> saveRDS("Map/svi2020_sf_4326.rds")
+```
+
+```{r mapsvi2}
+svi2020_sf_4326 <-
+  readRDS("Map/svi2020_sf_4326.rds") |>
+  filter(!STATEFP %in% c("02",
+                         "15", "60",
+                         "66", "69",
+                         "72", "78")) |> # limit to contiguous states and DC
+  st_as_sf()
+```
+
+```{r leafletsvi}
+pal_svi <- colorNumeric("inferno", NULL, reverse = TRUE)
+
+svi2020_sf_4326  |>
+  filter(!is.na(FUNCSTAT)) |>
+  st_simplify(dTolerance = 1e3)  |>
+  leaflet() |>
+  addPolygons(
+    stroke = FALSE,
+    # remove polygon borders
+    fillColor = ~ pal_svi(RPL_THEMES),
+    fillOpacity = 0.5,
+    smoothFactor = 0.5
+    # increase opacity and resolution
+  ) |>
+  addProviderTiles(providers$CartoDB.Voyager) |> # add third party provider tile
+  addLegend(
+    "bottomright",
+    # location of legend
+    pal = pal_svi,
+    # palette function
+    values = ~ RPL_THEMES,
+    # variable to pass to palette function
+    title = 'SVI',
+    # legend title
+    opacity = 1 # legend opacity (1 = completely opaque)
+  ) |>
+  addScaleBar()
+```
+
+#### Philadelphia SVI
+
+```{r}
+svi2020_phily <- svi2020_sf |>
+  filter(FIPS =="42101")
+svi2020_sf_4326_phily <- st_transform(svi2020_phily, crs = 4326)
+svi2020_sf_4326_phily |> saveRDS("Map/svi2020_sf_4326_phily.rds")
+```
+
+```{r}
+svi2020_sf_4326_phily <-
+  readRDS("Map/svi2020_sf_4326_phily.rds")|>
+  st_as_sf()
+```
+
+```{r leafletsvi}
+pal_svi <- colorNumeric("inferno", NULL, reverse = TRUE)
+
+svi2020_sf_4326_phily  |>
+  filter(!is.na(FUNCSTAT)) |>
+  st_simplify(dTolerance = 1e3)  |>
+  leaflet() |>
+  addPolygons(
+    stroke = FALSE,
+    # remove polygon borders
+    fillColor = ~ pal_svi(RPL_THEMES),
+    fillOpacity = 0.5,
+    smoothFactor = 0.5
+    # increase opacity and resolution
+  ) |>
+  addProviderTiles(providers$CartoDB.Voyager) |> # add third party provider tile
+  addLegend(
+    "bottomright",
+    # location of legend
+    pal = pal_svi,
+    # palette function
+    values = ~ RPL_THEMES,
+    # variable to pass to palette function
+    title = 'SVI',
+    # legend title
+    opacity = 1 # legend opacity (1 = completely opaque)
+  ) |>
+  addScaleBar()
+```
+
+#### PA, DE and NJ
+
+```{r}
+svi2020_states <- svi2020_sf |>
+  filter(ST_ABBR %in% c("PA","NJ","DE"))
+svi2020_sf_4326_states <- st_transform(svi2020_states, crs = 4326)
+```
+
+```{r}
+svi2020_sf_4326_states |> saveRDS("Map/svi2020_sf_4326_states.rds")
+```
+
+```{r}
+svi2020_sf_4326_states <-
+  readRDS("Map/svi2020_sf_4326_states.rds")|>
+  st_as_sf()
+```
+
+```{r leafletsvi}
+pal_svi <- colorNumeric("inferno", NULL, reverse = TRUE)
+
+svi2020_sf_4326_states  |>
+  filter(!is.na(FUNCSTAT)) |>
+  st_simplify(dTolerance = 1e3)  |>
+  leaflet() |>
+  addPolygons(
+    stroke = FALSE,
+    # remove polygon borders
+    fillColor = ~ pal_svi(RPL_THEMES),
+    fillOpacity = 0.5,
+    smoothFactor = 0.5
+    # increase opacity and resolution
+  ) |>
+  addProviderTiles(providers$CartoDB.Voyager) |> # add third party provider tile
+  addLegend(
+    "bottomright",
+    # location of legend
+    pal = pal_svi,
+    # palette function
+    values = ~ RPL_THEMES,
+    # variable to pass to palette function
+    title = 'SVI',
+    # legend title
+    opacity = 1 # legend opacity (1 = completely opaque)
+  ) |>
+  addScaleBar()
+```
+
+
+### Corrplot
+
+```{R}
+svi2020 |> glimpse()
+
+svi2020 |>
+  select(starts_with("RPL")) |>
+  summary()
+
+svi2020_corr_plot <- svi2020 |>
+  select(starts_with("RPL")) |>
+  get_corr_plot()
+svi2020_corr_plot
+```
+
+## ADI
+
+### Interactive Map
+
+#### Nationwide map
+
+```{r}
+adi2021 <- read_csv("Data/US_2021_ADI_Census_Block_Group_v4_0_1.csv")
+tigris_cbg <- block_groups(cb = TRUE)  |>
+  filter(!STATEFP %in% c("02",
+                         "15", "60",
+                         "66", "69",
+                         "72", "78"))
+
+adi2021 |> glimpse()
+
+adi2021_sf <- adi2021 |>
+  inner_join(tigris_cbg, by = c("FIPS" = "GEOID")) |>
+  st_as_sf()
+
+adi2021_cbg_sf_4326 <- st_transform(adi2021_sf, crs = 4326)
+adi2021_cbg_sf_4326 |> saveRDS("Map/adi2021_cbg_sf_4326.rds")
+```
+
+
+```{R}
+adi_no_cbg <- adi2021 |>
+  anti_join(tigris_cbg, by = c("FIPS" = "GEOID"))
+
+cbg_no_adi <- tigris_cbg |>
+  anti_join(adi2021, by = c("GEOID" = "FIPS"))
+```
+
+```{r}
+contig_state_vctr <- datasets::state.abb |>
+  setdiff(c("AK", "HI"))
+cbg_counts <- list()
+for (contig_state in contig_state_vctr) {
+  cbg_counts[[contig_state]] <- get_decennial(
+    geography = "block group",
+    variables = "P1_001N",
+    state = contig_state,
+    year = 2020,
+    output = "wide"
+  ) |>
+    mutate(state_abb = contig_state)
+}
+cbg_counts |> saveRDS("Map/cbg_counts.RDS")
+```
+
+```{R}
+cbg_counts <- readRDS("Map/cbg_counts.RDS") |> 
+  bind_rows()
+
+# computed cbg weights for county-level
+cbg_wts <- tigris_cbg |> 
+  select(STATEFP, COUNTYFP, TRACTCE, BLKGRPCE, GEOID) |>
+  st_drop_geometry() |> 
+  inner_join(cbg_counts, by = "GEOID") |> 
+  group_by(STATEFP, COUNTYFP) |>
+  # county pop
+  mutate(county_pop = sum(P1_001N)) |> 
+  ungroup() |> 
+  # cbg pop / county pop
+  mutate(cbg_wt = P1_001N/county_pop) |>
+  arrange(GEOID)
+
+cbg_wts |> saveRDS("Map/cbg_wts.RDS")
+```
+
+```{r}
+cbg_wts <- readRDS("Map/cbg_wts.RDS")
+adi2021_cbg_sf_4326 <- readRDS("Map/adi2021_cbg_sf_4326.rds")
+
+# compute weighted average for adi at county-level
+county_adi <- adi2021_cbg_sf_4326 |>
+  st_drop_geometry() |> 
+  select(-STATEFP, -COUNTYFP, -TRACTCE, -BLKGRPCE, -NAME) |> 
+  inner_join(cbg_wts, by = c("FIPS" = "GEOID")) |>
+  mutate(ADI_NATRANK = as.numeric(ADI_NATRANK)) |>
+  filter(!is.na(ADI_NATRANK)) |>
+  # national adi rank * cbg wt
+  mutate(adi_wts = ADI_NATRANK * cbg_wt) |>
+  group_by(STATEFP, COUNTYFP) |>
+  # weighted average sum of weighted adis
+  summarize(county_adi_value = sum(adi_wts)) |> 
+  ungroup()
+
+county_adi |> saveRDS("Map/county_adi.RDS")
+```
+
+```{r}
+county_adi <- readRDS("Map/county_adi.RDS") |>
+  mutate(FIPS = paste0(STATEFP, COUNTYFP)) |>
+  select(-STATEFP,-COUNTYFP) |>
+  left_join(tigris_counties, by = c("FIPS" = "GEOID")) |>
+  st_as_sf()
+
+adi2021_county_sf_4326 <- st_transform(county_adi, crs = 4326)
+adi2021_county_sf_4326 |> saveRDS("Map/adi2021_county_sf_4326.rds")
+```
+
+```{r}
+adi2021_county_sf_4326 <- readRDS("Map/adi2021_county_sf_4326.rds")
+
+
+pal_adi <- colorNumeric("inferno", NULL, reverse = TRUE)
+
+adi2021_county_sf_4326  |>
+  st_simplify(dTolerance = 1e3)  |>
+  leaflet() |>
+  addPolygons(
+    stroke = FALSE,
+    # remove polygon borders
+    fillColor = ~  pal_adi(county_adi_value),
+    fillOpacity = 0.5,
+    smoothFactor = 0.5
+    # increase opacity and resolution
+  ) |>
+  addProviderTiles(providers$CartoDB.Voyager) |> # add third party provider tile
+  addLegend(
+    "bottomright",
+    # location of legend
+    pal = pal_adi,
+    # palette function
+    values = ~ county_adi_value,
+    # variable to pass to palette function
+    title = 'adi',
+    # legend title
+    opacity = 1 # legend opacity (1 = completely opaque)
+  ) |>
+  addScaleBar()
+```
+
+```{r}
+library(ggplot2)
+library(sf)
+library(RColorBrewer)
+
+simplified_sf <- st_simplify(adi2021_county_sf_4326, dTolerance = 1e3)
+color_palette <- colorRampPalette(brewer.pal(9, "Blues"))
+
+ggplot() +
+  geom_sf(data = simplified_sf,
+          aes(fill = county_adi_value),
+          color =  NA, 
+          alpha = 0.5,
+          size = 0.5,
+          inherit.aes = FALSE) +
+  scale_fill_gradientn(colors =  color_palette, na.value = "grey") +
+  theme_minimal()+
+  ggtitle("ADI 2021") +
+  coord_sf() 
+
+```
+
+
+#### Philadelphia
+
+```{r}
+adi2021_phily_sf_4326 <- adi2021_county_sf_4326|>
+  filter(NAME == "Philadelphia")
+  
+pal_adi <- colorNumeric("inferno", NULL, reverse = TRUE)
+
+adi2021_phily_sf_4326  |>
+  st_simplify(dTolerance = 1e3)  |>
+  leaflet() |>
+  addPolygons(
+    stroke = FALSE,
+    # remove polygon borders
+    fillColor = ~ pal_adi(county_adi_value),
+    fillOpacity = 0.5,
+    smoothFactor = 0.5
+    # increase opacity and resolution
+  ) |>
+  addProviderTiles(providers$CartoDB.Voyager) |> # add third party provider tile
+  addLegend(
+    "bottomright",
+    # location of legend
+    pal = pal_adi,
+    # palette function
+    values = ~ county_adi_value,
+    # variable to pass to palette function
+    title = 'adi',
+    # legend title
+    opacity = 1 # legend opacity (1 = completely opaque)
+  ) |>
+  addScaleBar()
+```
+
+```{r}
+simplified_sf_phily <- st_simplify(adi2021_phily_sf_4326, dTolerance = 1e3)
+
+# Create a color palette
+color_palette <- colorRampPalette(brewer.pal(9, "Blues"))
+
+# Create a ggplot object
+ggplot() +
+  geom_sf(data = simplified_sf_phily,
+          aes(fill = county_adi_value),
+          color = NA, # remove polygon borders
+          alpha = 0.5, # fill opacity
+          size = 0.5, # smooth factor
+          inherit.aes = FALSE) +
+  scale_fill_gradientn(colors = color_palette(100), na.value = "grey") +
+  theme_minimal() +
+  ggtitle("ADI 2021 - Philadelphia") +
+  coord_sf()
+```
+
+#### PA, NJ, and DE
+
+```{R}
+adi2021_state_sf_4326 <- adi2021_county_sf_4326|>
+  filter(STATEFP %in% c(34,42,10))
+  
+pal_adi <- colorNumeric("inferno", NULL, reverse = TRUE)
+
+adi2021_state_sf_4326  |>
+  st_simplify(dTolerance = 1e3)  |>
+  leaflet() |>
+  addPolygons(
+    stroke = FALSE,
+    # remove polygon borders
+    fillColor = ~ pal_adi(county_adi_value),
+    fillOpacity = 0.5,
+    smoothFactor = 0.5
+    # increase opacity and resolution
+  ) |>
+  addProviderTiles(providers$CartoDB.Voyager) |> # add third party provider tile
+  addLegend(
+    "bottomright",
+    # location of legend
+    pal = pal_adi,
+    # palette function
+    values = ~ county_adi_value,
+    # variable to pass to palette function
+    title = 'adi',
+    # legend title
+    opacity = 1 # legend opacity (1 = completely opaque)
+  ) |>
+  addScaleBar()
+```
+
+```{r}
+state_simplified_sf <- st_simplify(adi2021_state_sf_4326, dTolerance = 1e3)
+
+ggplot() +
+  geom_sf(data = state_simplified_sf,
+          aes(fill = county_adi_value),
+          color = NA, # remove polygon borders
+          alpha = 0.5, # fill opacity
+          size = 0.5, # smooth factor
+          inherit.aes = FALSE) +
+  scale_fill_gradientn(colors = color_palette(100), na.value = "grey") +
+  theme_minimal() +
+  ggtitle("ADI 2021 - State") +
+  coord_sf()
+```
+
+### Correlation matrix
+
+```{r}
+county_adi <- readRDS("Map/county_adi.RDS")
+# compare SVI and ADI across entire US
+svi_adi_county <- county_adi |>
+  mutate(FIPS = paste0(STATEFP, COUNTYFP)) |> 
+  select(FIPS, county_adi_value) |>
+  st_drop_geometry() |>
+  inner_join(svi2020_sf_4326 |> st_drop_geometry(),
+             by = "FIPS") |>
+  select(FIPS, county_adi_value, starts_with("RPL_"), NAME) |>
+  rename(svi_t1_ses = RPL_THEME1, # Socioeconomic Status - RPL_THEME1
+         svi_t2_household = RPL_THEME2, # Household Characteristics - RPL_THEME2
+         svi_t3_raceethnicity = RPL_THEME3, # Racial & Ethnic Minority Status - RPL_THEME3
+         svi_t4_housingtransport = RPL_THEME4, # Housing Type & Transportation - RPL_THEME4
+         svi_overall = RPL_THEMES)
+
+svi_adi_county_corr_plot <- svi_adi_county |>
+  select(-NAME, -FIPS) |>
+  select(svi_t1_ses,
+         svi_t2_household,
+         svi_t3_raceethnicity,
+         svi_t4_housingtransport,
+         svi_overall,
+         county_adi_value)  |> 
+  get_corr_plot()
+svi_adi_county_corr_plot
+```
+
+#### Area level analysis
+
+##### Combine dataset
+
+```{r}
+county_cts <- get_decennial(
+  geography = "county",
+  variables = "P1_001N",
+  year = 2020,
+  output = "wide"
+) |>
+  rename(county_ct = P1_001N)
+
+county_cts |> saveRDS("Map/county_cts.RDS")
+```
+
+```{r}
+
+# computed county mmsa weights for county-level
+county_mmsa_wts <- tigris_counties |>
+  select(STATEFP, COUNTYFP , GEOID) |>
+  st_drop_geometry() |>
+  inner_join(county_cts, by = "GEOID") |>
+  right_join(
+    mmsa_county_mapping,
+    by = c("STATEFP" = "fips_state_code",
+           "COUNTYFP" = "fips_county_code")
+  ) |>
+  group_by(d_mmsa) |>
+  # mmsa_pop
+  mutate(mmsa_pop = sum(county_ct)) |> 
+  ungroup() |> 
+  # county_ct pop / mmsa_pop
+  mutate(county_mmsa_wt = county_ct/mmsa_pop) |>
+  arrange(GEOID)
+
+county_mmsa_wts |> saveRDS("Map/county_mmsa_wts.RDS")
+county_mmsa_wts <- readRDS("Map/county_mmsa_wts.RDS")
+```
+
+```{r}
+county_cts <- readRDS("Map/county_cts.RDS")
+
+area_combined_dataset <- mmsa_county_mapping_geoid_sf_4326 |>
+  select(d_mmsa, county_county_equivalent, fips_state_code, fips_county_code) |>
+  left_join(select(ever_asthma_mmsa_tbl, -mmsaname), by = "d_mmsa") |> 
+  left_join(select(ever_smoker_mmsa_tbl, -mmsaname), by = "d_mmsa") |>
+  mutate(GEOID = paste0(fips_state_code, fips_county_code)) |>
+  left_join(county_cts, by = "GEOID") |>
+  st_join(select(svi2020_sf_4326, starts_with("RPL")),
+          left = TRUE,
+          join = st_equals) |> 
+  st_join(select(adi2021_county_sf_4326, county_adi_value),
+          left = TRUE,
+          join = st_equals) |>
+  mutate(
+    n_w_ever_smoker = floor(w_ever_smoker * county_ct),
+    n_uw_ever_smoker = floor(uw_ever_smoker * county_ct),
+    n_w_ever_asthma = floor(w_ever_asthma * county_ct),
+    n_uw_ever_asthma = floor(uw_ever_asthma * county_ct),
+    county_adi_value = county_adi_value/100 # divide by 100 to match scale of SVI
+  ) |> 
+  rename(svi_t1_ses = RPL_THEME1, # Socioeconomic Status - RPL_THEME1
+         svi_t2_household = RPL_THEME2, # Household Characteristics - RPL_THEME2
+         svi_t3_raceethnicity = RPL_THEME3, # Racial & Ethnic Minority Status - RPL_THEME3
+         svi_t4_housingtransport = RPL_THEME4, # Housing Type & Transportation - RPL_THEME4
+         svi_overall = RPL_THEMES)
+
+area_combined_dataset |> saveRDS("Map/area_combined_dataset.rds")
+```
+
+
+
