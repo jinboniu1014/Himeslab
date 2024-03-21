@@ -1,0 +1,428 @@
+---
+title: "ADI ACS tract Philadelphia"
+author: "Jinbo niu"
+date: "2024-02-21"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(fmsb)
+library(RColorBrewer)
+```
+
+```{r}
+plot_theme <- function() {
+  theme_bw() +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 10, hjust = 0.5),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8),
+        plot.title = element_text(size = 15, face = "bold"),
+        plot.subtitle = element_text(size = 10),
+        plot.caption = element_text(size = 8, hjust = 0, face = "italic"))}
+```
+
+```{R}
+GetACS <- function(vars_vec){
+  # Get variables for each state
+  # Combine into a single data frame
+  acs_all <- get_acs(survey = "acs5", year = 2020, variables = vars_vec,state = "PA",geography = "tract",county = "Philadelphia")
+  #acs_all <- mutate(acs_all, GEOID = paste0(state, county, tract, block_group))
+  return(acs_all)}
+```
+
+```{r}
+vars_education <- c("B15003_001", "B15003_002", "B15003_003", "B15003_004", 
+                    "B15003_005", "B15003_006", "B15003_007", "B15003_008", 
+                    "B15003_009", "B15003_010", "B15003_011", "B15003_012", 
+                    "B15003_017", "B15003_018", "B15003_019", "B15003_020", 
+                    "B15003_021", "B15003_022", "B15003_023", "B15003_024", 
+                    "B15003_025")
+
+edu_raw <- GetACS(vars_education)
+edu_phily <- edu_raw %>%
+  group_by(GEOID) %>%
+  summarise(tot = sum(estimate[variable%in% c("B15003_001")]),
+            less9_num = sum(estimate[variable %in% c("B15003_002", "B15003_003", "B15003_004", "B15003_005", "B15003_006", "B15003_007", "B15003_008", "B15003_009", "B15003_010", "B15003_011", "B15003_012")]),
+            hs_num = sum(estimate[variable %in% c("B15003_017", "B15003_018", "B15003_019", "B15003_020", "B15003_021", "B15003_022", "B15003_023", "B15003_024", "B15003_025")]),
+            col_num = sum(estimate[variable %in% c("B15003_022", "B15003_023", "B15003_024", "B15003_025")]),
+            grad_num = sum(estimate[variable %in% c("B15003_023", "B15003_024", "B15003_025")])) %>%
+  mutate(less9 = less9_num / tot,
+         hs = hs_num / tot,
+         col = col_num / tot,
+         grad = grad_num / tot) %>%
+  select(GEOID, less9, hs, col, grad)
+
+head(edu_phily)
+summary(edu_phily)
+```
+
+```{r}
+vars_whitecollar <- c("C24010_001E", "C24010_003E", "C24010_027E", "C24010_039E", 
+                      "C24010_063E")
+whc_raw <- GetACS(vars_whitecollar)
+
+whc_phily <- whc_raw %>%
+  group_by(GEOID) %>%
+  summarise(tot = sum(estimate[variable %in% c("C24010_001")]),
+            whc_num = sum(estimate[variable %in% c("C24010_003", "C24010_027", "C24010_039", "C24010_063")]),
+            whc = whc_num / tot) %>%
+  select(GEOID, whc)
+
+head(whc_phily)
+summary(whc_phily)
+```
+
+```{r}
+# 3c. Income 
+#     Income disparity defined by Singh 2003 as the log of 100 * ratio of 
+#     number of households making <$10k and the number of households making 
+#     ≥$50k
+vars_income <- c("B19001_001E", "B19001_002E", "B19001_011E", "B19001_012E", 
+                 "B19001_013E", "B19001_014E", "B19001_015E", "B19001_016E", 
+                 "B19001_017E", "B19013_001E")
+inc_raw <- GetACS(vars_income)
+
+inc_phily <- inc_raw |>
+  group_by(GEOID) |>
+  summarise(less10k_num = sum(estimate[variable %in% c("B19001_002")]),
+            more50k_num = sum(estimate[variable %in% c("B19001_011", "B19001_012", "B19001_013","B19001_014","B19001_015","B19001_016" ,"B19001_017")]),
+            # To keep income disparity fron taking Inf/-Inf values, we will force
+            # non-0 counts by taking max(1, X)
+            dis = log(100*max(1, less10k_num)/max(1, more50k_num)),
+            medinc = estimate[variable %in% c("B19013_001")]) |>
+  select(GEOID, medinc, dis)
+
+head(inc_phily)
+summary(inc_phily)
+```
+
+```{r}
+# 3d. Housing
+vars_housing <- c("B25077_001E", "B25064_001E", "B25088_002E")
+hou_raw <- GetACS(vars_housing)
+
+hou_phily <- hou_raw |>
+  group_by(GEOID) |>
+            # median home value
+  summarise(medval = estimate[variable %in% c("B25077_001")],
+            # median gross rent
+            medren = estimate[variable %in% c("B25064_001")],
+            # median monthly mortgage
+            medmor = estimate[variable %in% c("B25088_002")])
+
+head(hou_phily)
+summary(hou_phily)
+```
+
+```{r}
+# 3e. Tenure
+vars_tenure <- c("B25003_001E", "B25003_002E")
+ten_raw <- GetACS(vars_tenure)
+ten_phily <- ten_raw |>
+  group_by(GEOID) |>
+  summarise(tot = estimate[variable %in% c("B25003_001")],
+            # number of owner occupied housing units
+            oo_num = estimate[variable %in% c("B25003_002")],
+            own = oo_num/tot) |>
+  select(GEOID, own)
+
+head(ten_phily)
+summary(ten_phily)
+```
+
+```{r}
+# 3f. Unemployment
+vars_unemployment <- c("B23025_003E", "B23025_005E")
+une_raw <- GetACS(vars_unemployment)
+une_phily <- une_raw |>
+  group_by(GEOID) |>
+            # denominator is number in civilian labor force
+  summarise(tot = estimate[variable %in% c("B23025_003")],
+            # unemployed in civilian labor force 
+            une_num = estimate[variable %in% c("B23025_005")],
+            une = une_num/tot) |>
+  select(GEOID, une)
+
+head(une_phily)
+summary(une_phily)
+```
+
+```{r}
+# 3g. Poverty
+vars_poverty <- c("B17010_001E", "B17010_002E", "C17002_001E", "C17002_002E", 
+                  "C17002_003E", "C17002_004E", "C17002_005E")
+pov_raw <- GetACS(vars_poverty)
+pov_phily <- pov_raw |>
+  group_by(GEOID) |>
+            # denominator 1: number of families surveyed
+  summarise(tot1 = estimate[variable %in% c("B17010_001")],
+            # number of families living below the poverty threshold
+            pov_num = estimate[variable %in% c("B17010_002")],
+            # denominator 2: number of individuals surveyed
+            tot2 = estimate[variable %in% c("C17002_001")],
+            # individuals living below 150% of federal poverty threshold
+            p1.5_num = sum(estimate[variable %in% c("C17002_002","C17002_003", "C17002_004", "C17002_005")]),
+            pov = pov_num/tot1,
+            p1.5 = p1.5_num/tot2) |>
+  select(GEOID, pov, p1.5)
+
+head(pov_phily)
+summary(pov_phily)
+```
+
+```{r}
+# 3h. Single parent household
+vars_singleparent <- c("B11003_001E", "B11003_010E", "B11003_016E")
+spa_raw <- GetACS(vars_singleparent)
+spa_phily <- spa_raw |>
+  group_by(GEOID) |>
+  summarise(tot = estimate[variable %in% c("B11003_001")],
+            spa_num = estimate[variable %in% c("B11003_010", "B11003_016")],
+            spa = spa_num/tot) |>
+  select(GEOID, spa)
+
+head(spa_phily)
+summary(spa_phily)
+```
+
+```{R}
+# 3i. Housing quality
+vars_housequality <- c("B25044_001E", "B25044_003E", "B25044_010E", # no vehicle
+                       "B25043_001E", "B25043_007E", "B25043_016E",  # no telephone
+                       "B25047_001E", "B25047_003E",  # no plumbing 
+                       "B25014_001E", "B25014_005E", "B25014_006E",
+                       "B25014_007E", "B25014_011E", "B25014_012E",
+                       "B25014_013E")
+hqu_raw <- GetACS(vars_housequality)
+hqu_phily <- hqu_raw |>
+  group_by(GEOID) |>
+  summarise(tot1 = estimate[variable %in% c("B25044_001")],
+            veh_num = sum(estimate[variable %in% c("B25044_003", "B25044_010")]),
+            tot2 = estimate[variable %in% c("B25043_001")],
+            tel_num = sum(estimate[variable %in% c("B25043_007", "B25043_016")]),
+            tot3 = estimate[variable %in% c("B25047_001")],
+            plu_num = estimate[variable %in% c("B25047_003")],
+            tot4 = estimate[variable %in% c("B25014_001")],
+            cro_num = sum(estimate[variable %in% c("B25014_005", "B25014_006", "B25014_007","B25014_011" , "B25014_012" ,"B25014_013")]),
+            veh = veh_num/tot1,
+            tel = tel_num/tot2,
+            plu = plu_num/tot3,
+            cro = cro_num/tot4) |>
+  select(GEOID, veh, tel, plu, cro) 
+
+head(hqu_phily)
+summary(hqu_phily)
+```
+
+```{r}
+# 3j. Racial composition
+vars_race <- c("B01001_001E",   # Total
+               "B01001A_001E",  # White alone total
+               "B01001B_001E",  # Black alone total
+               "B01001D_001E",  # Asian alone total
+               "B01001I_001E")  # Hispanic/Latino total
+race_raw <- GetACS(vars_race)
+race_phily <- race_raw |>
+  group_by(GEOID) |>
+  summarise(tot = estimate[variable %in% c("B01001_001")],
+            whi_num = estimate[variable %in% c("B01001A_001")],
+            bla_num = estimate[variable %in% c("B01001B_001")],
+            asi_num = estimate[variable %in% c("B01001D_001")],
+            lat_num = estimate[variable %in% c("B01001I_001")],
+            white_percent = whi_num/tot,
+            black_percent = bla_num/tot,
+            asian_percent = asi_num/tot,
+            latin_percent = lat_num/tot) |>
+  select(GEOID, white_percent, black_percent, asian_percent, latin_percent) 
+
+head(race_phily)
+summary(race_phily)
+```
+
+```{r}
+# 3k. Household size
+vars_hhsize <- c("B11016_001E", "B11016_002E", "B11016_003E", "B11016_004E", 
+                 "B11016_005E", "B11016_006E", "B11016_007E", "B11016_008E",
+                 "B11016_009E", "B11016_010E", "B11016_011E", "B11016_012E",
+                 "B11016_013E", "B11016_014E", "B11016_015E", "B11016_016E")
+hhsize_raw <- GetACS(vars_hhsize)
+hhsize_phily <- hhsize_raw |>
+  group_by(GEOID) |>
+  summarise(tot = estimate[variable %in% c("B11016_001")],
+            hh1_num = estimate[variable %in% c("B11016_010")],
+            hh2_num = sum(estimate[variable %in% c("B11016_003" , "B11016_011")]),
+            hh3_num = sum(estimate[variable %in% c("B11016_004", " B11016_005", "B11016_012", "B11016_013")]),
+            hh5_num = sum(estimate[variable %in% c("B11016_006" , "B11016_007", "B11016_008" ,"B11016_014" ,"B11016_015", "B11016_016")]),
+            hh7_num = sum(estimate[variable %in% c("B11016_008", "B11016_016")]),
+            hh1 = hh1_num/tot,
+            hh2 = hh2_num/tot,
+            hh3 = hh3_num/tot,
+            hh5 = hh5_num/tot,
+            hh7 = hh7_num/tot) |>
+  select(GEOID, hh1, hh2, hh3, hh5, hh7) 
+
+head(hhsize_phily)
+summary(hhsize_phily)
+```
+
+```{R}
+# 3l. General population features
+var_popcount <- "B01003_001E"
+pop_raw <- GetACS(var_popcount)
+
+shapes_phily <- tigris::tracts(state = "PA",county = "Philadelphia")
+
+shapes_area <- shapes_phily |>
+  mutate(ALAND = st_area(shapes_phily))|>
+  mutate(A_KMSQ = ALAND/1,000,000) |>
+  select(GEOID, A_KMSQ)
+
+units(shapes_area$A_KMSQ) <- "km^2"
+
+pop_phily <- full_join(pop_raw, shapes_area, by = "GEOID") |>
+  mutate(pop_count = estimate[variable %in% c("B01003_001")],
+         pop_density = estimate[variable %in% c("B01003_001")]/A_KMSQ) |>
+  dplyr::select(GEOID, pop_count, pop_density)
+
+head(pop_phily)
+summary(pop_phily)
+```
+
+```{r}
+# 3m. Age Distribution
+vars_age <- c("B01001_002E", "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E", "B01001_011E", "B01001_012E", "B01001_013E", "B01001_014E", "B01001_015E", "B01001_016E", "B01001_017E", "B01001_018E", "B01001_019E", "B01001_020E", "B01001_021E", "B01001_022E", "B01001_023E", "B01001_024E", "B01001_025E", "B01001_026E", "B01001_031E", "B01001_032E", "B01001_033E", "B01001_034E", "B01001_035E", "B01001_036E", "B01001_037E", "B01001_038E", "B01001_039E", "B01001_040E", "B01001_041E", "B01001_042E", "B01001_043E", "B01001_044E", "B01001_045E", "B01001_046E", "B01001_047E", "B01001_048E", "B01001_049E")
+age_raw <- GetACS(vars_age)
+age_phily <- age_raw |>
+  group_by(GEOID) |>
+  # total male + total female (SEX BY AGE)
+  summarise(tot = sum(estimate[variable %in% c("B01001_002", "B01001_026")]),
+age18_34_num = sum(estimate[variable %in% c("B01001_007", "B01001_008", "B01001_009", "B01001_0010","B01001_011", "B01001_012", "B01001_031", "B01001_032")]),
+age35_49_num = sum(estimate[variable %in% c("B01001_013", "B01001_014", "B01001_015", "B01001_037","B01001_038", "B01001_039")]),
+age50_64_num = sum(estimate[variable %in% c("B01001_016", "B01001_017", "B01001_018", "B01001_019","B01001_040", "B01001_041", "B01001_042", "B01001_043")]),
+age65_num = sum(estimate[variable %in% c("B01001_020", "B01001_021", "B01001_022", "B01001_023","B01001_024", "B01001_025", "B01001_044", "B01001_045","B01001_046", "B01001_047", "B01001_048", "B01001_049")]),
+age18_34 =age18_34_num / tot,
+age35_49 =age35_49_num / tot,
+age50_64 = age50_64_num / tot,
+age65 = age65_num / tot
+) |>
+  select(GEOID, age18_34, age35_49, age50_64, age65)
+
+head(age_phily)
+summary(age_phily)
+```
+
+## Combine ACS to calculate ADI
+
+```{r}
+# 4. Combine ACS variables into a single data frame and calculate ADI
+##-----------------------------------------------------------------------------
+
+
+acs_full_phily <- full_join(edu_phily, whc_phily, by = "GEOID")|>
+  full_join(inc_phily, by = "GEOID")|>
+  full_join(hou_phily,by = "GEOID")|>
+  full_join(ten_phily, by = "GEOID")|>
+  full_join(une_phily, by = "GEOID")|>
+  full_join(pov_phily, by = "GEOID")|>
+  full_join(spa_phily, by = "GEOID")|>
+  full_join(hqu_phily, by = "GEOID")|>
+  full_join(race_phily, by = "GEOID")|>
+  full_join(hhsize_phily, by = "GEOID")|>
+  full_join(pop_phily, by = "GEOID")|>
+  full_join(age_phily,by = "GEOID") |>
+  mutate(ADI_raw = 0.0849*less9 - 0.0970*hs - 0.0874*whc - 0.0977*medinc 
+         + 0.0936*dis - 0.0688*medval - 0.0781*medren - 0.0770*medmor 
+         - 0.0615*own + 0.0806*une + 0.0977*pov + 0.1037*p1.5 + 0.0719*spa 
+         + 0.0694*veh + 0.0877*tel + 0.0510*plu + 0.0556*cro,
+         ADI_score = 100 + 20*scale(ADI_raw))
+
+# Calculate ADI percentile
+acs_full_phily$ADI_perc <- as.integer(NA)
+acs_full_phily$ADI_perc[! is.na(acs_full_phily$ADI_score)] <- percentile(na.omit(acs_full_phily$ADI_score))
+
+# Edit and Save
+acs_full_phily <- filter(acs_full_phily, !is.na(less9))
+saveRDS(acs_full_phily, "Map/ADI_ACS_phily.rds")
+```
+
+```{r}
+acs_full_phily <-readRDS("Map/ADI_ACS_phily.rds")
+mapacs_phily <- left_join(acs_full_phily, shapes_phily, by="GEOID") |>
+  st_as_sf()
+
+mapacs_phily_score <- mapacs_phily|>
+  filter(!is.na(ADI_score))
+
+mapacs_phily_percentile <- mapacs_phily|>
+  filter(!is.na(ADI_perc))
+
+mapacs_phily_raw <- mapacs_phily|>
+  filter(!is.na(ADI_raw))
+
+phily <- shapes_phily
+```
+
+```{r}
+adi_score_phily <- ggplot() +
+  geom_sf(data = mapacs_phily_score, aes(fill = ADI_score), lwd=0) +
+  scale_fill_distiller(name = "ADI Score", palette = "YlOrRd", direction = 1) +
+  labs(title = "ADI Score in Philadelphia", 
+       subtitle = "by Tract Subdivision | ACS 2016-20") +
+  xlab("Area Deprivation Index is based on 17 poverty, \neducation, housing, and unemployment indicators.") +
+  geom_sf(data = phily, color = "gray20", lwd=0.2, fill = NA) +
+  plot_theme()
+
+print(adi_score_phily)
+```
+
+```{r}
+adi_percentile_phily <- ggplot() +
+  geom_sf(data = mapacs_phily_percentile, aes(fill = ADI_perc), lwd=0) +
+  scale_fill_distiller(name = "ADI Percentile", palette = "YlOrRd", direction = 1) +
+  labs(title = "ADI Percentile in Philadelphia", 
+       subtitle = "by Tract Subdivision | ACS 2016-20") +
+  xlab("Area Deprivation Index is based on 17 poverty, \neducation, housing, and unemployment indicators.") +
+  geom_sf(data = phily, color = "gray20", lwd=0.2, fill = NA) +
+  plot_theme()
+print(adi_percentile_phily)
+```
+
+```{r}
+adi_raw_phily <- ggplot() +
+  geom_sf(data = mapacs_phily_raw, aes(fill = ADI_raw), lwd=0) +
+  scale_fill_gradient2(name = "Raw ADI Score") +
+  labs(title = "Raw ADI Score in Philadelphia", 
+       subtitle = "by Tract Subdivision | ACS 2016-20") +
+  xlab("Area Deprivation Index is based on 17 poverty, \neducation, housing, and unemployment indicators.") +
+  geom_sf(data = phily, color = "gray20", lwd=0.2, fill = NA) +
+  plot_theme()
+
+print(adi_raw_phily)
+```
+
+```{r}
+ggsave("Map Visuals/ADI ACS/ADI ACS phily (tract).png",adi_score_phily,width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+ggsave("Map Visuals/ADI ACS/ADI Percentile ACS phily (tract).png",adi_percentile_phily,width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+ggsave("Map Visuals/ADI ACS/ADI raw ACS phily (tract).png",adi_raw_phily,width = 10, height = 8, dpi = 300)
+```
+
+
